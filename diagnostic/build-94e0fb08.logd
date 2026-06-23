@@ -1,0 +1,11 @@
+﻿py : .............
+At line:1 char:147
++ ... e-Output "Commit: $short"; py tools/test_health_check.py 2>&1 | Out-F ...
++                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (.............:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+----------------------------------------------------------------------
+Ran 13 tests in 0.042s
+
+OK

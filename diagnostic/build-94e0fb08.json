@@ -1,0 +1,88 @@
+﻿{
+  "timestamp": "2026-06-23T13:39:57.408549",
+  "hostname": "MekkinaDesktop",
+  "services": {
+    "backend": {
+      "status": "CRITICAL",
+      "detail": "[WinError 10061] No connection could be made because the target machine actively refused it",
+      "code": 0,
+      "endpoint": "http://localhost:8080/health"
+    },
+    "market": {
+      "status": "CRITICAL",
+      "detail": "[WinError 10061] No connection could be made because the target machine actively refused it",
+      "code": 0,
+      "endpoint": "http://localhost:8081/health"
+    },
+    "frailbox": {
+      "status": "CRITICAL",
+      "detail": "[WinError 10061] No connection could be made because the target machine actively refused it",
+      "code": 0,
+      "endpoint": "http://localhost:8082/health"
+    },
+    "frontend": {
+      "status": "CRITICAL",
+      "detail": "[WinError 10061] No connection could be made because the target machine actively refused it",
+      "code": 0,
+      "endpoint": "http://localhost:3000/"
+    }
+  },
+  "infrastructure": {
+    "postgresql": {
+      "status": "CRITICAL",
+      "detail": "Connection refused",
+      "endpoint": "localhost:5432"
+    },
+    "redis": {
+      "status": "CRITICAL",
+      "detail": "Connection refused",
+      "endpoint": "localhost:6379"
+    },
+    "kafka": {
+      "status": "CRITICAL",
+      "detail": "Connection refused",
+      "endpoint": "localhost:9092"
+    }
+  },
+  "system": {
+    "disk": {
+      "status": "WARNING",
+      "detail": "Cannot check: module 'os' has no attribute 'statvfs'"
+    },
+    "memory": {
+      "status": "WARNING",
+      "detail": "Cannot check: [Errno 2] No such file or directory: '/proc/meminfo'"
+    },
+    "load": {
+      "status": "WARNING",
+      "detail": "Cannot check: [Errno 2] No such file or directory: '/proc/loadavg'"
+    }
+  },
+  "overall_status": "DEGRADED",
+  "rate_limiter": {
+    "rate": 5.0,
+    "burst": 5,
+    "current_tokens": 4,
+    "throttled": 0,
+    "total_requests": 4,
+    "probe_rate_adjusted": 5.0
+  },
+  "circuit_breakers": {
+    "backend": {
+      "state": "CLOSED",
+      "failure_count": 1
+    },
+    "market": {
+      "state": "CLOSED",
+      "failure_count": 1
+    },
+    "frailbox": {
+      "state": "CLOSED",
+      "failure_count": 1
+    },
+    "frontend": {
+      "state": "CLOSED",
+      "failure_count": 1
+    }
+  }
+}

@@ -28,6 +28,8 @@ Usage:
     python3 health_check.py --service backend # Check specific service
     python3 health_check.py --json            # JSON output
     python3 health_check.py --watch           # Continuous monitoring
+    python3 health_check.py --timeout 10      # Per-service timeout in seconds
+    python3 health_check.py --probe-rate 5    # Max probes per second
 """
 
 import argparse
@@ -38,8 +40,11 @@ import ssl
 import subprocess
 import sys
 import time
+import threading
+from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -63,6 +68,83 @@ DISK_THRESHOLD_CRITICAL = 90
 
 MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
+
+CB_STATE_CLOSED = "CLOSED"
+CB_STATE_HALF_OPEN = "HALF_OPEN"
+CB_STATE_OPEN = "OPEN"
+
+
+# ---------------------------------------------------------------------------
+# TOKEN BUCKET RATE LIMITER
+# ---------------------------------------------------------------------------
+
+class TokenBucket:
+    def __init__(self, rate: float, burst: Optional[int] = None):
+        self.rate = rate
+        self.burst = burst or int(rate)
+        self.tokens = self.burst
+        self.last_refill = time.monotonic()
+        self.throttled_count = 0
+        self.total_requests = 0
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens: int = 1) -> bool:
+        with self._lock:
+            self.total_requests += 1
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+            self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+            self.last_refill = now
+            if self.tokens >= tokens:
+                self.tokens -= tokens
+                return True
+            self.throttled_count += 1
+            return False
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "rate": self.rate,
+                "burst": self.burst,
+                "current_tokens": round(self.tokens, 2),
+                "throttled": self.throttled_count,
+                "total_requests": self.total_requests,
+            }
+
+    def set_rate(self, rate: float):
+        with self._lock:
+            self.rate = rate
+
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = 3, recovery_timeout: float = 30.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.state = CB_STATE_CLOSED
+        self.last_failure_time = 0.0
+
+    def record_success(self):
+        self.failure_count = 0
+        if self.state == CB_STATE_HALF_OPEN:
+            self.state = CB_STATE_CLOSED
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.monotonic()
+        if self.failure_count >= self.failure_threshold:
+            self.state = CB_STATE_OPEN
+
+    def allow_request(self) -> bool:
+        if self.state == CB_STATE_CLOSED:
+            return True
+        if self.state == CB_STATE_OPEN:
+            if time.monotonic() - self.last_failure_time >= self.recovery_timeout:
+                self.state = CB_STATE_HALF_OPEN
+                return True
+            return False
+        return True
+
 
 # ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
@@ -200,78 +282,128 @@ def check_load_average() -> Tuple[str, str, float]:
 # HEALTH CHECK RUNNER
 # ---------------------------------------------------------------------------
 
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
-    results: Dict[str, Any] = {
-        "timestamp": datetime.now().isoformat(),
-        "hostname": socket.gethostname(),
-        "services": {},
-        "infrastructure": {},
-        "system": {},
-        "overall_status": "OK",
-    }
+class HealthCheckRunner:
+    def __init__(self, default_timeout: int = 5, probe_rate: float = 10.0):
+        self.default_timeout = default_timeout
+        self.rate_limiter = TokenBucket(rate=probe_rate)
+        self.circuit_breakers: Dict[str, CircuitBreaker] = defaultdict(CircuitBreaker)
 
-    all_ok = True
+    def _get_timeout(self, config: dict) -> int:
+        return self.default_timeout if self.default_timeout else config.get("timeout", 5)
 
-    # Check services
-    for name, config in SERVICES.items():
-        if service and name != service:
-            continue
-        status, detail, code = check_http_service(
-            config["host"], config["port"], config["path"], config["timeout"]
-        )
-        results["services"][name] = {
-            "status": status,
-            "detail": detail,
-            "code": code,
-            "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
+    def _rate_adjusted_probe_rate(self) -> float:
+        open_cbs = sum(1 for cb in self.circuit_breakers.values() if cb.state == CB_STATE_HALF_OPEN)
+        if open_cbs > 0:
+            return self.rate_limiter.rate * 0.5
+        return self.rate_limiter.rate
+
+    def run_checks(self, service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
+        results: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+            "hostname": socket.gethostname(),
+            "services": {},
+            "infrastructure": {},
+            "system": {},
+            "overall_status": "OK",
         }
-        if status == "CRITICAL":
-            all_ok = False
 
-    # Check infrastructure
-    for name, config in INFRASTRUCTURE.items():
-        if service and name != service:
-            continue
-        status, detail, latency = check_tcp_port(config["host"], config["port"], config["timeout"])
-        results["infrastructure"][name] = {
-            "status": status,
-            "detail": detail,
-            "endpoint": f"{config['host']}:{config['port']}",
-        }
-        if status == "CRITICAL":
-            all_ok = False
+        all_ok = True
+        probe_rate_adjusted = self._rate_adjusted_probe_rate()
 
-    # Check system resources
-    disk_status, disk_detail, disk_pct = check_disk_usage()
-    results["system"]["disk"] = {"status": disk_status, "detail": disk_detail}
-    if disk_status == "CRITICAL":
-        all_ok = False
+        # Check services
+        for name, config in SERVICES.items():
+            if service and name != service:
+                continue
+            if not self.rate_limiter.acquire():
+                results["services"][name] = {
+                    "status": "WARNING",
+                    "detail": "Rate limited (probe skipped)",
+                    "code": 0,
+                    "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
+                }
+                continue
 
-    mem_status, mem_detail, mem_pct = check_memory_usage()
-    results["system"]["memory"] = {"status": mem_status, "detail": mem_detail}
-    if mem_status == "CRITICAL":
-        all_ok = False
+            cb = self.circuit_breakers[name]
+            if not cb.allow_request():
+                results["services"][name] = {
+                    "status": "CRITICAL",
+                    "detail": f"Circuit breaker OPEN (suppressed)",
+                    "code": 0,
+                    "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
+                }
+                all_ok = False
+                continue
 
-    load_status, load_detail, load_val = check_load_average()
-    results["system"]["load"] = {"status": load_status, "detail": load_detail}
-
-    # Check certificate expiry (web services)
-    for name, config in SERVICES.items():
-        if service and name != service:
-            continue
-        if config["port"] == 443:
-            cert_status, cert_detail, days_left = check_certificate_expiry(config["host"])
-            results["services"][name]["certificate"] = {
-                "status": cert_status,
-                "detail": cert_detail,
-                "days_remaining": days_left,
+            timeout = self._get_timeout(config)
+            status, detail, code = check_http_service(
+                config["host"], config["port"], config["path"], timeout
+            )
+            results["services"][name] = {
+                "status": status,
+                "detail": detail,
+                "code": code,
+                "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
             }
-            if cert_status == "CRITICAL":
+            if status == "CRITICAL":
+                cb.record_failure()
+                all_ok = False
+            else:
+                cb.record_success()
+
+        # Check infrastructure
+        for name, config in INFRASTRUCTURE.items():
+            if service and name != service:
+                continue
+            timeout = self._get_timeout(config)
+            status, detail, latency = check_tcp_port(config["host"], config["port"], timeout)
+            results["infrastructure"][name] = {
+                "status": status,
+                "detail": detail,
+                "endpoint": f"{config['host']}:{config['port']}",
+            }
+            if status == "CRITICAL":
                 all_ok = False
 
-    results["overall_status"] = "OK" if all_ok else "DEGRADED"
+        # Check system resources
+        disk_status, disk_detail, disk_pct = check_disk_usage()
+        results["system"]["disk"] = {"status": disk_status, "detail": disk_detail}
+        if disk_status == "CRITICAL":
+            all_ok = False
 
-    return results
+        mem_status, mem_detail, mem_pct = check_memory_usage()
+        results["system"]["memory"] = {"status": mem_status, "detail": mem_detail}
+        if mem_status == "CRITICAL":
+            all_ok = False
+
+        load_status, load_detail, load_val = check_load_average()
+        results["system"]["load"] = {"status": load_status, "detail": load_detail}
+
+        # Check certificate expiry
+        for name, config in SERVICES.items():
+            if service and name != service:
+                continue
+            if config["port"] == 443:
+                cert_status, cert_detail, days_left = check_certificate_expiry(config["host"])
+                results["services"][name]["certificate"] = {
+                    "status": cert_status,
+                    "detail": cert_detail,
+                    "days_remaining": days_left,
+                }
+                if cert_status == "CRITICAL":
+                    all_ok = False
+
+        # Rate limiter stats
+        results["rate_limiter"] = {
+            **self.rate_limiter.stats(),
+            "probe_rate_adjusted": probe_rate_adjusted,
+        }
+        results["circuit_breakers"] = {
+            name: {"state": cb.state, "failure_count": cb.failure_count}
+            for name, cb in self.circuit_breakers.items()
+        }
+        results["overall_status"] = "OK" if all_ok else "DEGRADED"
+
+        return results
 
 
 def print_health_report(results: Dict[str, Any]):
@@ -297,6 +429,18 @@ def print_health_report(results: Dict[str, Any]):
                         if isinstance(sub_check, dict) and "status" in sub_check:
                             sub_icon = {"OK": "✓", "WARNING": "⚠", "CRITICAL": "✗"}.get(sub_check["status"], "?")
                             print(f"      {sub_icon} {sub_name}: {sub_check['detail']}")
+
+    rl = results.get("rate_limiter", {})
+    print(f"\n  Rate Limiter:")
+    print(f"    Rate: {rl.get('rate', 'N/A')}/s (adjusted: {rl.get('probe_rate_adjusted', 'N/A')}/s)")
+    print(f"    Throttled: {rl.get('throttled', 0)} / {rl.get('total_requests', 0)} requests")
+
+    cbs = results.get("circuit_breakers", {})
+    if cbs:
+        print(f"\n  Circuit Breakers:")
+        for name, state_info in cbs.items():
+            print(f"    {name}: {state_info.get('state', 'N/A')} (failures: {state_info.get('failure_count', 0)})")
+
     print()
 
 
@@ -307,17 +451,20 @@ def parse_args():
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
+    parser.add_argument("--timeout", type=int, default=0, help="Per-service timeout override in seconds (default: use per-endpoint timeout)")
+    parser.add_argument("--probe-rate", "--probe_rate", type=float, default=10.0, help="Max probes per second (token bucket rate)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    runner = HealthCheckRunner(default_timeout=args.timeout, probe_rate=args.probe_rate)
 
     if args.watch:
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
         try:
             while True:
-                results = run_health_checks(args.service, args.json)
+                results = runner.run_checks(args.service, args.json)
                 if args.json:
                     print(json.dumps(results, indent=2))
                 else:
@@ -326,7 +473,7 @@ def main():
         except KeyboardInterrupt:
             print("\nMonitoring stopped")
     else:
-        results = run_health_checks(args.service, args.json)
+        results = runner.run_checks(args.service, args.json)
         if args.json:
             output = json.dumps(results, indent=2)
             print(output)
